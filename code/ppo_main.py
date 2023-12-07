@@ -1,125 +1,120 @@
-"""
-    This file is the executable for running PPO. It is based on this medium article: 
-    https://medium.com/@eyyu/coding-ppo-from-scratch-with-pytorch-part-1-4-613dfc1b14c8
-"""
-
-import gym
-import sys
+from ppo_utils import evaluate_policy, str2bool
+from datetime import datetime
+from ppo import PPO_discrete
+import gymnasium as gym
+import os, shutil
+import argparse
 import torch
 
-from ppo_arguments import get_args
-from ppo import PPO
-from ppo_network import FeedForwardNN
-from eval_policy import eval_policy
+'''Hyperparameter Setting'''
+parser = argparse.ArgumentParser()
+parser.add_argument('--dvc', type=str, default='cpu', help='running device: cuda or cpu')
+parser.add_argument('--EnvIdex', type=int, default=0, help='CP-v1, LLd-v2')
+parser.add_argument('--write', type=str2bool, default=False, help='Use SummaryWriter to record the training')
+parser.add_argument('--render', type=str2bool, default=False, help='Render or Not')
+parser.add_argument('--Loadmodel', type=str2bool, default=False, help='Load pretrained model or Not')
+parser.add_argument('--ModelIdex', type=int, default=300000, help='which model to load')
+
+parser.add_argument('--seed', type=int, default=209, help='random seed')
+parser.add_argument('--T_horizon', type=int, default=2048, help='lenth of long trajectory')
+parser.add_argument('--Max_train_steps', type=int, default=5e7, help='Max training steps')
+parser.add_argument('--save_interval', type=int, default=1e5, help='Model saving interval, in steps.')
+parser.add_argument('--eval_interval', type=int, default=5e3, help='Model evaluating interval, in steps.')
+
+parser.add_argument('--gamma', type=float, default=0.99, help='Discounted Factor')
+parser.add_argument('--lambd', type=float, default=0.95, help='GAE Factor')
+parser.add_argument('--clip_rate', type=float, default=0.2, help='PPO Clip rate')
+parser.add_argument('--K_epochs', type=int, default=10, help='PPO update times')
+parser.add_argument('--net_width', type=int, default=64, help='Hidden net width')
+parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+parser.add_argument('--l2_reg', type=float, default=0, help='L2 regulization coefficient for Critic')
+parser.add_argument('--batch_size', type=int, default=64, help='lenth of sliced trajectory')
+parser.add_argument('--entropy_coef', type=float, default=0, help='Entropy coefficient of Actor')
+parser.add_argument('--entropy_coef_decay', type=float, default=0.99, help='Decay rate of entropy_coef')
+parser.add_argument('--adv_normalization', type=str2bool, default=False, help='Advantage normalization')
+opt = parser.parse_args()
+opt.dvc = torch.device(opt.dvc) # from str to torch.device
+print(opt)
 
 
-def train(env, hyperparameters, actor_model, critic_model):
-    """
-        Trains the model.
+def main():
+    # Build Training Env and Evaluation Env
+    EnvName = ['CartPole-v1','LunarLander-v2']
+    BriefEnvName = ['CP-v1','LLd-v2']
+    env = gym.make(EnvName[opt.EnvIdex], render_mode = "human" if opt.render else None)
+    eval_env = gym.make(EnvName[opt.EnvIdex])
+    opt.state_dim = env.observation_space.shape[0]
+    opt.action_dim = env.action_space.n
+    opt.max_e_steps = env._max_episode_steps
 
-        Parameters:
-            env - the environment to train on
-            hyperparameters - a dict of hyperparameters to use, defined in main
-            actor_model - the actor model to load in if we want to continue training
-            critic_model - the critic model to load in if we want to continue training
+    # Seed Everything
+    env_seed = opt.seed
+    torch.manual_seed(opt.seed)
+    torch.cuda.manual_seed(opt.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print("Random Seed: {}".format(opt.seed))
 
-        Return:
-            None
-    """    
-    print(f"Training", flush=True)
+    print('Env:',BriefEnvName[opt.EnvIdex],'  state_dim:',opt.state_dim,'  action_dim:',opt.action_dim,'   Random Seed:',opt.seed, '  max_e_steps:',opt.max_e_steps)
+    print('\n')
 
-    # Create a model for PPO.
-    model = PPO(policy_class=FeedForwardNN, env=env, **hyperparameters)
+    # Use tensorboard to record training curves
+    if opt.write:
+        from torch.utils.tensorboard import SummaryWriter
+        timenow = str(datetime.now())[0:-10]
+        timenow = ' ' + timenow[0:13] + '_' + timenow[-2::]
+        writepath = 'runs/{}'.format(BriefEnvName[opt.EnvIdex]) + timenow
+        if os.path.exists(writepath): shutil.rmtree(writepath)
+        writer = SummaryWriter(log_dir=writepath)
 
-    # Tries to load in an existing actor/critic model to continue training on
-    if actor_model != '' and critic_model != '':
-        print(f"Loading in {actor_model} and {critic_model}...", flush=True)
-        model.actor.load_state_dict(torch.load(actor_model))
-        model.critic.load_state_dict(torch.load(critic_model))
-        print(f"Successfully loaded.", flush=True)
-    elif actor_model != '' or critic_model != '': # Don't train from scratch if user accidentally forgets actor/critic model
-        print(f"Error: Either specify both actor/critic models or none at all. We don't want to accidentally override anything!")
-        sys.exit(0)
+    if not os.path.exists('model'): os.mkdir('model')
+    agent = PPO_discrete(**vars(opt))
+    if opt.Loadmodel: agent.load(opt.ModelIdex)
+
+    if opt.render:
+        while True:
+            ep_r = evaluate_policy(env, agent, turns=1)
+            print(f'Env:{EnvName[opt.EnvIdex]}, Episode Reward:{ep_r}')
     else:
-        print(f"Training from scratch.", flush=True)
+        traj_lenth, total_steps = 0, 0
+        while total_steps < opt.Max_train_steps:
+            s, info = env.reset(seed=env_seed)  # Do not use opt.seed directly, or it can overfit to opt.seed
+            env_seed += 1
+            done = False
 
-    # Train the PPO model with a specified total timesteps
-    # NOTE: You can change the total timesteps here, I put a big number just because
-    # you can kill the process whenever you feel like PPO is converging
-    model.learn(total_timesteps=200_000_000)
+            '''Interact & trian'''
+            while not done:
+                '''Interact with Env'''
+                a, logprob_a = agent.select_action(s, deterministic=False) # use stochastic when training
+                s_next, r, dw, tr, info = env.step(a) # dw: dead&win; tr: truncated
+                if r <=-100: r = -30  #good for LunarLander
+                done = (dw or tr)
 
+                '''Store the current transition'''
+                agent.put_data(s, a, r, s_next, logprob_a, done, dw, idx = traj_lenth)
+                s = s_next
 
-def test(env, actor_model):
-    """
-        Tests the model.
+                traj_lenth += 1
+                total_steps += 1
 
-        Parameters:
-            env - the environment to test the policy on
-            actor_model - the actor model to load in
+                '''Update if its time'''
+                if traj_lenth % opt.T_horizon == 0:
+                    agent.train()
+                    traj_lenth = 0
 
-        Return:
-            None
-    """
-    print(f"Testing {actor_model}", flush=True)
+                '''Record & log'''
+                if total_steps % opt.eval_interval == 0:
+                    score = evaluate_policy(eval_env, agent, turns=3) # evaluate the policy for 3 times, and get averaged result
+                    if opt.write: writer.add_scalar('ep_r', score, global_step=total_steps)
+                    print('EnvName:',EnvName[opt.EnvIdex],'seed:',opt.seed,'steps: {}k'.format(int(total_steps/1000)),'score:', score)
 
-    # If the actor model is not specified, then exit
-    if actor_model == '':
-        print(f"Didn't specify model file. Exiting.", flush=True)
-        sys.exit(0)
+                '''Save model'''
+                if total_steps % opt.save_interval==0:
+                    agent.save(total_steps)
 
-    # Extract out dimensions of observation and action spaces
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
-
-    # Build our policy the same way we build our actor model in PPO
-    policy = FeedForwardNN(obs_dim, act_dim)
-
-    # Load in the actor model saved by the PPO algorithm
-    policy.load_state_dict(torch.load(actor_model))
-
-    # Evaluate our policy with a separate module, eval_policy, to demonstrate
-    # that once we are done training the model/policy with ppo.py, we no longer need
-    # ppo.py since it only contains the training algorithm. The model/policy itself exists
-    # independently as a binary file that can be loaded in with torch.
-    eval_policy(policy=policy, env=env, render=True)
-
-
-def main(args):
-    """
-        The main function to run.
-
-        Parameters:
-            args - the arguments parsed from command line
-
-        Return:
-            None
-    """
-    # NOTE: Here's where you can set hyperparameters for PPO. I don't include them as part of
-    # ArgumentParser because it's too annoying to type them every time at command line. Instead, you can change them here.
-    # To see a list of hyperparameters, look in ppo.py at function _init_hyperparameters
-    hyperparameters = {
-                'timesteps_per_batch': 2048, 
-                'max_timesteps_per_episode': 200, 
-                'gamma': 0.99, 
-                'n_updates_per_iteration': 10,
-                'lr': 3e-4, 
-                'clip': 0.2,
-                'render': True,
-                'render_every_i': 10
-              }
-
-    # Creates the environment we'll be running. If you want to replace with your own
-    # custom environment, note that it must inherit Gym and have both continuous
-    # observation and action spaces.
-    env = gym.make('Pendulum-v1')
-
-    # Train or test, depending on the mode specified
-    if args.mode == 'train':
-        train(env=env, hyperparameters=hyperparameters, actor_model=args.actor_model, critic_model=args.critic_model)
-    else:
-        test(env=env, actor_model=args.actor_model)
+        env.close()
+        eval_env.close()
 
 
 if __name__ == '__main__':
-    args = get_args()  # Parse arguments from command line
-    main(args)
+    main()
