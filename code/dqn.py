@@ -6,6 +6,8 @@ from keras.models import Sequential
 from keras.layers.core import Dense, Activation
 from keras.optimizers import RMSprop
 from tqdm import tqdm
+from keras.models import clone_model
+
 
 class Constants:
     hit = 'hit'
@@ -301,14 +303,57 @@ class Deck:
         return self._cards.pop()
 
 
+class DoubleDQNLearner(DQNLearner):
+    def __init__(self):
+        super().__init__()
+        # Clone the model for the target network
+        self._target_model = clone_model(self._model)
+        self._target_model.set_weights(self._model.get_weights())
+
+    def update_target_model(self):
+        """ Update the target model to match the primary model """
+        self._target_model.set_weights(self._model.get_weights())
+
+    def update(self, new_state, reward):
+        if self._learning:
+            # Predict Q-values for the new state using the primary model
+            future_rewards = self._model.predict([np.array([new_state])], batch_size=1)
+
+            # Select the action using the primary model but evaluate using the target model
+            max_action = np.argmax(future_rewards)
+            target_future_rewards = self._target_model.predict([np.array([new_state])], batch_size=1)
+            maxQ = target_future_rewards[0][max_action]
+            new = self._discount * maxQ
+
+            # Update the target as before
+            target = self._last_target.copy()
+            if self._last_action == Constants.hit:
+                target[0][0] = reward + new
+            else:
+                target[0][1] = reward + new
+
+            # Update the primary model
+            self._model.fit(np.array([self._last_state]), target, batch_size=1, epochs=1, verbose=0)
+
+            # Optionally update the target model at certain intervals
+            if self.game % some_interval == 0:
+                self.update_target_model()
+
+
 if __name__ == "__main__":
     num_learning_rounds = 20000
     game = Game(num_learning_rounds, DQNLearner())  # Deep Q Network Learner
-    # game = Game(num_learning_rounds, Learner()) #Q learner
+    # game2 = Game(num_learning_rounds, Learner()) #Q learner
+    # game3 = Game(num_learning_rounds, DoubleDQNLearner()) # Double Deep Q Network Learner
     number_of_test_rounds = 1000
     for k in range(0, num_learning_rounds + number_of_test_rounds):
         game.run()
 
     df = game.p.get_optimal_strategy()
     print(df)
+
     df.to_csv('../data/dqn.csv')
+
+    # df3 = game.p.get_optimal_strategy()
+    # print（df)
+    # df3.to_csv('../data/double_dqn.csv')
