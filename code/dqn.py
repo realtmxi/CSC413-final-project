@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 from keras.models import Sequential
-from keras.layers.core import Dense, Activation
+from keras.layers import Dense, Activation
 from keras.optimizers import RMSprop
 from tqdm import tqdm
 from keras.models import clone_model
@@ -303,57 +303,86 @@ class Deck:
         return self._cards.pop()
 
 
-class DoubleDQNLearner(DQNLearner):
-    def __init__(self):
+class DoubleDQNLearner(Learner):
+    def __init__(self, target_update_freq=100):
         super().__init__()
-        # Clone the model for the target network
-        self._target_model = clone_model(self._model)
-        self._target_model.set_weights(self._model.get_weights())
+        self._learning = True
+        self._learning_rate = 0.1
+        self._discount = 0.1
+        self._epsilon = 0.9
+        self.target_update_freq = target_update_freq
+        self._model = self._build_model()  # Create an online network
+        self.target_model = clone_model(self._model)  # Create a target network with the same architecture
+        self.target_model.set_weights(self._model.get_weights())  # Initialize target network weights
+        self.game = 0
 
-    def update_target_model(self):
-        """ Update the target model to match the primary model """
-        self._target_model.set_weights(self._model.get_weights())
+    def _build_model(self):
+        model = Sequential()
+        model.add(Dense(2, kernel_initializer='lecun_uniform', input_shape=(2,)))
+        model.add(Activation('relu'))
+        model.add(Dense(10, kernel_initializer='lecun_uniform'))
+        model.add(Activation('relu'))
+        model.add(Dense(4, kernel_initializer='lecun_uniform'))
+        model.add(Activation('linear'))
+        rms = RMSprop()
+        model.compile(loss='mse', optimizer=rms)
+        return model
+
+    def get_action(self, state):
+        rewards = self._model.predict(np.array([state]), batch_size=1, verbose=0)
+
+        if np.random.uniform(0, 1) < self._epsilon:
+            if rewards[0][0] > rewards[0][1]:
+                action = Constants.hit
+            else:
+                action = Constants.stay
+        else:
+            action = np.random.choice([Constants.hit, Constants.stay])
+
+        self._last_state = state
+        self._last_action = action
+        self._last_target = rewards
+
+        return action
 
     def update(self, new_state, reward):
         if self._learning:
-            # Predict Q-values for the new state using the primary model
-            future_rewards = self._model.predict([np.array([new_state])], batch_size=1)
-
-            # Select the action using the primary model but evaluate using the target model
-            max_action = np.argmax(future_rewards)
-            target_future_rewards = self._target_model.predict([np.array([new_state])], batch_size=1)
-            maxQ = target_future_rewards[0][max_action]
+            rewards = self.target_model.predict(np.array([new_state]), batch_size=1, verbose=0)
+            maxQ = rewards[0][0] if rewards[0][0] > rewards[0][1] else rewards[0][1]
             new = self._discount * maxQ
 
-            # Update the target as before
-            target = self._last_target.copy()
             if self._last_action == Constants.hit:
-                target[0][0] = reward + new
+                self._last_target[0][0] = reward + new
             else:
-                target[0][1] = reward + new
+                self._last_target[0][1] = reward + new
 
-            # Update the primary model
-            self._model.fit(np.array([self._last_state]), target, batch_size=1, epochs=1, verbose=0)
+            # Update online model
+            self._model.fit(np.array([self._last_state]), self._last_target, batch_size=1, epochs=1, verbose=0)
 
-            # Optionally update the target model at certain intervals
-            if self.game % some_interval == 0:
+            if self.game % self.target_update_freq == 0:
                 self.update_target_model()
+
+            print(f"State: {self._last_state}, Action: {self._last_action}, Reward: {reward}, New State: {new_state}")
+
+    def update_target_model(self):
+        # Update the target network with the weights from the online network
+        self.target_model.set_weights(self._model.get_weights())
 
 
 if __name__ == "__main__":
     num_learning_rounds = 20000
-    game = Game(num_learning_rounds, DQNLearner())  # Deep Q Network Learner
+    # game = Game(num_learning_rounds, DQNLearner())  # Deep Q Network Learner
     # game2 = Game(num_learning_rounds, Learner()) #Q learner
-    # game3 = Game(num_learning_rounds, DoubleDQNLearner()) # Double Deep Q Network Learner
+    game3 = Game(num_learning_rounds, DoubleDQNLearner()) # Double Deep Q Network Learner
     number_of_test_rounds = 1000
     for k in range(0, num_learning_rounds + number_of_test_rounds):
-        game.run()
+        game3.run()
 
-    df = game.p.get_optimal_strategy()
-    print(df)
+    # df = game.p.get_optimal_strategy()
+    # print(df)
 
-    df.to_csv('../data/dqn.csv')
+    # df.to_csv('../data/dqn.csv')
 
-    # df3 = game.p.get_optimal_strategy()
-    # print（df)
-    # df3.to_csv('../data/double_dqn.csv')
+    df3 = game.p.get_optimal_strategy()
+    print(df3)
+    df3.to_csv('../data/double_dqn.csv')
